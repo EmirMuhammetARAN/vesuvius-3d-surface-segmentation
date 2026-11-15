@@ -1,7 +1,7 @@
 """
-Complete Training Pipeline for Vesuvius Challenge Surface Detection
-Using 3D ResEncUNet, Mixed Precision (AMP), Cosine Annealing,
-and 1st-Place 5-step Topological Post-Processing Evaluation.
+Training pipeline for Vesuvius Challenge 3D Surface Detection.
+Supports ResEncUNet3D and SegResNet3D with Mixed Precision (AMP),
+cosine annealing LR scheduling, and topological validation.
 """
 
 import os
@@ -86,7 +86,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, accum_s
         running_bce += loss_dict["bce"].item()
         running_dice += loss_dict["dice"].item()
 
-        # CANLI İLERLEME (Her 40 adımda bir = ~10-15 saniyede bir ekranı canlı güncelle)
+        # Emit live progress every 40 steps so Colab/headless logs stream smoothly
         if (step + 1) % 40 == 0 or (step + 1) == n_batches or step == 0:
             step_num = step + 1
             pct_epoch = (step_num / n_batches) * 100.0
@@ -106,8 +106,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, accum_s
             bar_str = "=" * filled + ">" + " " * max(0, bar_len - filled - 1) if filled < bar_len else "=" * bar_len
             
             print(
-                f"[{bar_str}] GENEL: %{pct_overall:5.1f} | Ep {epoch:03d}/{total_epochs:03d} (Adım {step_num:03d}/{n_batches} - %{pct_epoch:3.0f}) | "
-                f"Loss: {cur_loss:.4f} (BCE: {cur_bce:.4f}, Dice: {cur_dice:.4f}) | Kalan: {eta_h:.1f} sa",
+                f"[{bar_str}] Progress: {pct_overall:5.1f}% | Ep {epoch:03d}/{total_epochs:03d} (Step {step_num:03d}/{n_batches} - {pct_epoch:3.0f}%) | "
+                f"Loss: {cur_loss:.4f} (BCE: {cur_bce:.4f}, Dice: {cur_dice:.4f}) | ETA: {eta_h:.1f}h",
                 flush=True
             )
 
@@ -170,6 +170,32 @@ def set_high_priority_and_prevent_sleep():
             print("[+] Windows Sleep Prevention: Active (system sleep/standby disabled during training)")
         except Exception as e:
             print(f"[!] Warning: Could not set sleep prevention: {e}")
+
+
+def save_resume_checkpoint(
+    paths,
+    epoch: int,
+    best_epoch: int,
+    model,
+    optimizer,
+    scaler,
+    score: float,
+    best_score: float,
+    no_improve_count: int = 0,
+):
+    """Save full optimizer, scaler, and model state for clean training resumption."""
+    payload = {
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "score": score,
+        "best_score": best_score,
+        "no_improve_count": no_improve_count,
+    }
+    for path in paths:
+        torch.save(payload, path)
 
 
 def get_cosine_lr(epoch: int, total_epochs: int, base_lr: float, eta_min: float = 1e-6, cycle_start: int = 1) -> float:
@@ -333,7 +359,7 @@ def main():
             vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
             
             print(f"\n{'='*80}", flush=True)
-            print(f"[>>>] EPOCH {epoch:03d}/{args.epochs:03d} BİTTİ | GENEL: %{pct_overall:5.1f} | Süre: {elapsed:.1f}s | Toplam Geçen: {elapsed_total/3600:.2f} sa | Kalan: {eta_h:.2f} sa", flush=True)
+            print(f"[>>>] EPOCH {epoch:03d}/{args.epochs:03d} COMPLETE | Progress: {pct_overall:5.1f}% | Epoch: {elapsed:.1f}s | Elapsed: {elapsed_total/3600:.2f}h | ETA: {eta_h:.2f}h", flush=True)
             print(f"      Train Loss: {train_loss:.4f} (BCE: {train_bce:.4f}, Dice: {train_dice:.4f}) | LR: {current_lr:.2e} | VRAM: {vram_gb:.1f}GB", flush=True)
             print(f"{'='*80}\n", flush=True)
 
@@ -357,16 +383,10 @@ def main():
                 if no_improve_count >= args.patience:
                     print(f"\n[*] Early Stopping triggered after {no_improve_count} epochs without improvement!")
                     print(f"[*] Best Model locked at Epoch {best_epoch} with Score: {best_score:.4f}")
-                    torch.save({
-                        "epoch": epoch,
-                        "best_epoch": best_epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scaler_state_dict": scaler.state_dict(),
-                        "score": current_eval,
-                        "best_score": best_score,
-                        "no_improve_count": no_improve_count
-                    }, latest_checkpoint)
+                    save_resume_checkpoint(
+                        [latest_checkpoint], epoch, best_epoch, model, optimizer, scaler,
+                        current_eval, best_score, no_improve_count
+                    )
                     break
 
             # Save interval snapshot if requested
@@ -375,17 +395,10 @@ def main():
                 torch.save(model.state_dict(), interval_path)
                 print(f"    --> [SNAPSHOT] Interval model saved to {interval_path}")
 
-            # Save full checkpoint
-            torch.save({
-                "epoch": epoch,
-                "best_epoch": best_epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "score": current_eval,
-                "best_score": best_score,
-                "no_improve_count": no_improve_count
-            }, latest_checkpoint)
+            save_resume_checkpoint(
+                [latest_checkpoint], epoch, best_epoch, model, optimizer, scaler,
+                current_eval, best_score, no_improve_count
+            )
 
         final_path = save_dir / f"{ckpt_prefix}_final.pth"
         torch.save(model.state_dict(), final_path)
@@ -394,16 +407,11 @@ def main():
     except KeyboardInterrupt:
         print("\n[!] Ctrl+C detected! Saving emergency checkpoint before exit...")
         emergency_path = save_dir / f"{ckpt_prefix}_interrupted.pth"
-        save_dict = {
-            "epoch": epoch if 'epoch' in locals() else start_epoch,
-            "best_epoch": best_epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "best_score": best_score
-        }
-        torch.save(save_dict, emergency_path)
-        torch.save(save_dict, latest_checkpoint)
+        interrupted_epoch = epoch if "epoch" in locals() else start_epoch
+        save_resume_checkpoint(
+            [emergency_path, latest_checkpoint], interrupted_epoch, best_epoch, model, optimizer, scaler,
+            best_score, best_score, no_improve_count
+        )
         print(f"[+] Emergency checkpoint safely saved to: {latest_checkpoint}")
         print("[+] You can resume anytime by running: python train.py --resume")
     finally:

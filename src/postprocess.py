@@ -1,13 +1,12 @@
 """
-5-Step Topological Post-Processing Pipeline (1st Place Vesuvius Solution)
+Topological 3D Post-Processing Pipeline for Vesuvius Surface Detection.
 
-Ablation impact from 1st place solution:
-- Raw Model: 0.572 (Public) / 0.596 (Private)
-- + Step 0: Remove small components (<20k voxels) -> 0.586 / 0.614
-- + Step 1: Plug 1-voxel holes (Watertight neighborhood) -> 0.598 / 0.622
-- + Step 2: Patch large holes (Heightmap interpolation) -> 0.601 / 0.625
-- + Step 3: Binary closing (Radius-3 sphere) -> 0.606 / 0.627
-- + Step 4: Binary fill holes -> 0.606 / 0.627 (Rank 1)
+Stages:
+1. Prune small disconnected noise components (< min_voxels)
+2. Morphological binary closing with a 3D spherical footprint
+3. Per-sheet 2D heightmap linear interpolation for internal tears
+4. 6/26-connected watertight tiny-hole plugging
+5. Enclosed 3D cavity filling via binary_fill_holes
 """
 
 import numpy as np

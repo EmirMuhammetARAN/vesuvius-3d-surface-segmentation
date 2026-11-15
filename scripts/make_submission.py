@@ -1,11 +1,10 @@
 """
-Grandmaster Inference & Submission Pipeline for Kaggle Vesuvius Challenge
+Local 3D Ensemble Inference & Kaggle Submission Pipeline.
 Features:
-- Multi-Model Ensembling (128^3 + 192^3 models blended)
-- 4x 3D Test-Time Augmentation (TTA: D, H, W flips)
-- 3D Sliding Window with Gaussian Blending Overlap
-- 1st Place 5-Step Topological Post-Processing (cc3d, LUT watertight, heightmap, cavities)
-- Generates valid Kaggle submission.zip
+- Multi-model ensembling (128^3 + 192^3 models blended)
+- 4x 3D Test-Time Augmentation (D, H, W flips)
+- 3D sliding window with Gaussian blending overlap
+- 5-step topological post-processing
 """
 
 import os
@@ -46,9 +45,8 @@ def predict_patch(model: torch.nn.Module, tensor_patch: torch.Tensor, use_tta: b
     with torch.amp.autocast("cuda"):
         logits = model(tensor_patch)
         if use_tta:
-            logits = logits + torch.flip(model(torch.flip(tensor_patch, dims=[2])), dims=[2])
-            logits = logits + torch.flip(model(torch.flip(tensor_patch, dims=[3])), dims=[3])
-            logits = logits + torch.flip(model(torch.flip(tensor_patch, dims=[4])), dims=[4])
+            for dim in (2, 3, 4):
+                logits = logits + torch.flip(model(torch.flip(tensor_patch, dims=[dim])), dims=[dim])
             logits = logits / 4.0
         probs = torch.sigmoid(logits)
     return probs.squeeze().cpu().numpy()
@@ -205,8 +203,7 @@ def generate_submission(
             )
             ensemble_prob_map += (prob_map / len(models_to_run))
 
-        # 5-Step Topological Post-Processing (1st Place Engine)
-        print(f"    Applying 1st Place 5-Step Topological Post-Processing (threshold={threshold})...")
+        print(f"    Applying topological post-processing (threshold={threshold})...")
         binary_mask = full_postprocess_pipeline(
             ensemble_prob_map,
             threshold=threshold,

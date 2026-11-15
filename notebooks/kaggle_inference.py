@@ -1,3 +1,11 @@
+"""
+Standalone Kaggle offline inference & submission script for Vesuvius Surface Detection.
+
+Architectures (ResEncUNet3D, PureSegResNet3D) and topological post-processing
+are kept self-contained in this file so it executes inside Kaggle Notebooks
+without requiring external package installation or internet access.
+"""
+
 import os
 import gc
 import time
@@ -232,19 +240,12 @@ def _run_patches_forward(
                 )
                 probs = probs * 0.5
             elif tta_mode >= 4:
-                # In-place 4x TTA (Original + X, Y, Z Flips sequentially to prevent VRAM spikes)
-                probs = probs + torch.flip(
-                    torch.sigmoid(model(torch.flip(batch_tensor, dims=[-1]))),
-                    dims=[-1]
-                )
-                probs = probs + torch.flip(
-                    torch.sigmoid(model(torch.flip(batch_tensor, dims=[-2]))),
-                    dims=[-2]
-                )
-                probs = probs + torch.flip(
-                    torch.sigmoid(model(torch.flip(batch_tensor, dims=[-3]))),
-                    dims=[-3]
-                )
+                # Apply axis flips sequentially to keep peak VRAM bounded
+                for dim in (-1, -2, -3):
+                    probs = probs + torch.flip(
+                        torch.sigmoid(model(torch.flip(batch_tensor, dims=[dim]))),
+                        dims=[dim]
+                    )
                 probs = probs * 0.25
 
             probs_np = probs.cpu().numpy()[:, 0]
@@ -269,8 +270,8 @@ def predict_volume_batched(
     tta_mode: int = 2
 ) -> np.ndarray:
     """
-    Rock-solid 3D sliding-window inference with automatic OOM batch-size fallback.
-    Accumulates in CPU RAM to prevent VRAM exhaustion on large hidden test volumes.
+    3D sliding-window inference with automatic OOM batch-size fallback.
+    Accumulates blended predictions on CPU to limit GPU VRAM usage on large volumes.
     """
     orig_D, orig_H, orig_W = volume_norm.shape
     pD, pH, pW = patch_size
@@ -330,8 +331,7 @@ def build_anisotropic_struct(z_radius: int = 3, xy_radius: int = 2) -> np.ndarra
 def patch_large_holes_heightmap_fast(sheet_mask: np.ndarray) -> np.ndarray:
     """
     Vectorized, boundary-subsampled 2D heightmap hole interpolation.
-    Uses only the 2-pixel rim around detected holes for Delaunay triangulation,
-    running ~1000x faster than full-sheet griddata while preserving hole repair accuracy.
+    Samples only the 2-pixel rim around detected holes for fast Delaunay triangulation.
     """
     coords = np.argwhere(sheet_mask > 0)
     if len(coords) < 100:
@@ -364,7 +364,7 @@ def patch_large_holes_heightmap_fast(sheet_mask: np.ndarray) -> np.ndarray:
     if len(hole_points) == 0 or len(hole_points) > 50000:
         return sheet_mask
 
-    # Only use the 2-pixel boundary rim around holes for fast, exact Delaunay interpolation
+    # Only sample the 2-pixel rim around detected holes for fast Delaunay interpolation
     rim_mask = ndimage.binary_dilation(holes_2d, iterations=2) & known_mask
     points = np.argwhere(rim_mask)
     if len(points) < 4:
@@ -483,17 +483,73 @@ def write_tiff_volume(path: str, volume: np.ndarray):
 
 def find_all_files(extension: str = ".pth"):
     found = []
+    skip_dirs = {".git", ".venv", "scratch", "__pycache__"}
     for search_root in ["/kaggle/input", "."]:
         if os.path.exists(search_root):
-            for root, _, files in os.walk(search_root, followlinks=True):
+            for root, dirs, files in os.walk(search_root, followlinks=True):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
                 for f in files:
                     if f.lower().endswith(extension.lower()):
                         found.append(os.path.join(root, f))
     return found
 
+ENSEMBLE_SPECS = (
+    ("seg_192_ft_best", "segresnet", (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-AllData-Best", 4.5),
+    ("seg_192_ft_snap", "segresnet", (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-AllData-Snap", 2.5),
+    ("seg_f2",          "segresnet", (160, 160, 160), 2, 0.500, 4, "SegResNet3D-p160-f2",           3.5),
+    ("seg_f1",          "segresnet", (160, 160, 160), 2, 0.500, 4, "SegResNet3D-p160-f1",           3.0),
+    ("seg_192_f3",      "segresnet", (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-f3",           2.5),
+    ("resenc_alldata",  "resenc",    (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-AllData",     2.0),
+    ("resenc_192_f3",   "resenc",    (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f3",          2.0),
+    ("resenc_192_f1",   "resenc",    (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f1",          1.5),
+    ("resenc_192_f2",   "resenc",    (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f2",          1.0),
+    ("resenc_160",      "resenc",    (160, 160, 160), 2, 0.500, 2, "ResEncUNet3D-p160-f1",          1.0),
+)
+
+
+def _match_ensemble_slot(filename: str):
+    """Map checkpoint filename to its ensemble slot, preventing cross-architecture mismatches."""
+    name = filename.lower()
+    if "segresnet" in name:
+        if "finetune" in name or "ft" in name:
+            if "best" in name:
+                return "seg_192_ft_best"
+            if "epoch" in name or "snap" in name:
+                return "seg_192_ft_snap"
+        elif "best" in name:
+            if "fold3" in name or "colab_fold3" in name:
+                return "seg_192_f3"
+            if "fold2" in name:
+                return "seg_f2"
+            return "seg_f1"
+    elif ("resenc" in name or "unet" in name) and "best" in name:
+        if "alldata" in name or "all_data" in name:
+            return "resenc_alldata"
+        if "fold3" in name or "colab_fold3" in name:
+            return "resenc_192_f3"
+        if "fold2" in name:
+            return "resenc_192_f2"
+        if "192" in name:
+            return "resenc_192_f1"
+        if "160" in name:
+            return "resenc_160"
+    return None
+
+
+def _build_backbone(arch: str, device: str) -> nn.Module:
+    if arch == "segresnet":
+        return PureSegResNet3D(
+            in_channels=1, out_channels=1, init_filters=32,
+            blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
+        ).to(device)
+    if arch == "resenc":
+        return ResEncUNet3D().to(device)
+    raise ValueError(f"Unknown backbone architecture: {arch}")
+
+
 def get_checkpoints_to_run(device: str):
     all_pths = find_all_files(".pth") + find_all_files(".pt")
-    # If fewer than 8 .pth files are found directly, check if a .zip archive in /kaggle/input contains .pth weights
+    # Extract checkpoints from attached .zip archives if loose .pth files are not directly mounted
     if len([p for p in all_pths if "best" in os.path.basename(p).lower()]) < 8:
         all_zips = find_all_files(".zip")
         extract_dir = "/tmp/extracted_ckpts"
@@ -520,175 +576,27 @@ def get_checkpoints_to_run(device: str):
     for p in all_pths:
         print(f"    - {p}")
 
-    ckpt_seg_192_ft_best = None
-    ckpt_seg_192_ft_snap = None
-    ckpt_resenc_160 = None
-    ckpt_resenc_192_f1 = None
-    ckpt_resenc_192_f2 = None
-    ckpt_resenc_192_f3 = None
-    ckpt_resenc_alldata = None
-    ckpt_seg_f1 = None
-    ckpt_seg_f2 = None
-    ckpt_seg_192_f3 = None
-
-    # Strict architecture and fold matching (Never cross-assign architectures)
+    resolved_paths = {}
     for p in all_pths:
-        name = os.path.basename(p).lower()
-
-        if "segresnet" in name:
-            if "finetune" in name or "ft" in name:
-                if "best" in name:
-                    ckpt_seg_192_ft_best = p
-                elif "epoch" in name or "snap" in name:
-                    ckpt_seg_192_ft_snap = p
-            elif "best" in name:
-                if "fold3" in name or "colab_fold3" in name:
-                    ckpt_seg_192_f3 = p
-                elif "fold2" in name:
-                    ckpt_seg_f2 = p
-                else:
-                    ckpt_seg_f1 = p
-        elif ("resenc" in name or "unet" in name) and "best" in name:
-            if "alldata" in name or "all_data" in name:
-                ckpt_resenc_alldata = p
-            elif "fold3" in name or "colab_fold3" in name:
-                ckpt_resenc_192_f3 = p
-            elif "fold2" in name:
-                ckpt_resenc_192_f2 = p
-            elif "192" in name:
-                ckpt_resenc_192_f1 = p
-            elif "160" in name:
-                ckpt_resenc_160 = p
+        slot = _match_ensemble_slot(os.path.basename(p))
+        if slot is not None:
+            resolved_paths[slot] = p
 
     models_to_run = []
     # Tuple format: (model, patch_size, batch_size, default_ov, default_tta, name, weight)
-
-    # 1. Pure PyTorch SegResNet-3D Models (Highest Scoring Backbone: +0.06 to +0.10 over ResEncUNet3D across all scrolls!)
-    if ckpt_seg_192_ft_best:
+    for slot, arch, patch_size, batch_size, ov, tta, display_name, weight in ENSEMBLE_SPECS:
+        ckpt_path = resolved_paths.get(slot)
+        if not ckpt_path:
+            continue
         try:
-            print(f"[+] Loading PureSegResNet3D (192^3, ALL-DATA 160-EPOCH SUPREME CHAMPION): {os.path.basename(ckpt_seg_192_ft_best)}")
-            m_seg_ft = PureSegResNet3D(
-                in_channels=1, out_channels=1, init_filters=32,
-                blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
-            ).to(device)
-            sd_seg_ft = torch.load(ckpt_seg_192_ft_best, map_location=device)
-            m_seg_ft.load_state_dict(sd_seg_ft.get("model_state_dict", sd_seg_ft))
-            m_seg_ft.eval()
-            models_to_run.append((m_seg_ft, (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-AllData-Best", 4.5))
+            print(f"[+] Loading {display_name} ({patch_size[0]}^3): {os.path.basename(ckpt_path)}")
+            model = _build_backbone(arch, device)
+            sd = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(sd.get("model_state_dict", sd))
+            model.eval()
+            models_to_run.append((model, patch_size, batch_size, ov, tta, display_name, weight))
         except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_seg_192_ft_best}: {e}")
-
-    if ckpt_seg_192_ft_snap:
-        try:
-            print(f"[+] Loading PureSegResNet3D (192^3, ALL-DATA Snapshot): {os.path.basename(ckpt_seg_192_ft_snap)}")
-            m_seg_snap = PureSegResNet3D(
-                in_channels=1, out_channels=1, init_filters=32,
-                blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
-            ).to(device)
-            sd_seg_snap = torch.load(ckpt_seg_192_ft_snap, map_location=device)
-            m_seg_snap.load_state_dict(sd_seg_snap.get("model_state_dict", sd_seg_snap))
-            m_seg_snap.eval()
-            models_to_run.append((m_seg_snap, (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-AllData-Snap", 2.5))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_seg_192_ft_snap}: {e}")
-
-    if ckpt_seg_f2:
-        try:
-            print(f"[+] Loading PureSegResNet3D (160^3, Fold 2 Overall Champion): {os.path.basename(ckpt_seg_f2)}")
-            m_seg2 = PureSegResNet3D(
-                in_channels=1, out_channels=1, init_filters=32,
-                blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
-            ).to(device)
-            sd_seg2 = torch.load(ckpt_seg_f2, map_location=device)
-            m_seg2.load_state_dict(sd_seg2.get("model_state_dict", sd_seg2))
-            m_seg2.eval()
-            models_to_run.append((m_seg2, (160, 160, 160), 2, 0.50, 4, "SegResNet3D-p160-f2", 3.5))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_seg_f2}: {e}")
-
-    if ckpt_seg_f1:
-        try:
-            print(f"[+] Loading PureSegResNet3D (160^3, Fold 1 Champion): {os.path.basename(ckpt_seg_f1)}")
-            m_seg1 = PureSegResNet3D(
-                in_channels=1, out_channels=1, init_filters=32,
-                blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
-            ).to(device)
-            sd_seg1 = torch.load(ckpt_seg_f1, map_location=device)
-            m_seg1.load_state_dict(sd_seg1.get("model_state_dict", sd_seg1))
-            m_seg1.eval()
-            models_to_run.append((m_seg1, (160, 160, 160), 2, 0.50, 4, "SegResNet3D-p160-f1", 3.0))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_seg_f1}: {e}")
-
-    if ckpt_seg_192_f3:
-        try:
-            print(f"[+] Loading PureSegResNet3D (192^3, Fold 3 Champion): {os.path.basename(ckpt_seg_192_f3)}")
-            m_seg3 = PureSegResNet3D(
-                in_channels=1, out_channels=1, init_filters=32,
-                blocks_down=(1, 2, 2, 4), blocks_up=(1, 1, 1)
-            ).to(device)
-            sd_seg3 = torch.load(ckpt_seg_192_f3, map_location=device)
-            m_seg3.load_state_dict(sd_seg3.get("model_state_dict", sd_seg3))
-            m_seg3.eval()
-            models_to_run.append((m_seg3, (192, 192, 192), 2, 0.665, 2, "SegResNet3D-p192-f3", 2.5))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_seg_192_f3}: {e}")
-
-    # 2. ResEncUNet3D Models (Complementary Multi-Scale Support)
-    if ckpt_resenc_alldata:
-        try:
-            print(f"[+] Loading ResEncUNet3D (192^3, ALL-DATA Champion): {os.path.basename(ckpt_resenc_alldata)}")
-            m_all = ResEncUNet3D().to(device)
-            sd_all = torch.load(ckpt_resenc_alldata, map_location=device)
-            m_all.load_state_dict(sd_all.get("model_state_dict", sd_all))
-            m_all.eval()
-            models_to_run.append((m_all, (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-AllData", 2.0))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_resenc_alldata}: {e}")
-
-    if ckpt_resenc_192_f3:
-        try:
-            print(f"[+] Loading ResEncUNet3D (192^3, Fold 3): {os.path.basename(ckpt_resenc_192_f3)}")
-            m192_3 = ResEncUNet3D().to(device)
-            sd192_3 = torch.load(ckpt_resenc_192_f3, map_location=device)
-            m192_3.load_state_dict(sd192_3.get("model_state_dict", sd192_3))
-            m192_3.eval()
-            models_to_run.append((m192_3, (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f3", 2.0))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_resenc_192_f3}: {e}")
-
-    if ckpt_resenc_192_f1:
-        try:
-            print(f"[+] Loading ResEncUNet3D (192^3, Fold 1): {os.path.basename(ckpt_resenc_192_f1)}")
-            m192_1 = ResEncUNet3D().to(device)
-            sd192_1 = torch.load(ckpt_resenc_192_f1, map_location=device)
-            m192_1.load_state_dict(sd192_1.get("model_state_dict", sd192_1))
-            m192_1.eval()
-            models_to_run.append((m192_1, (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f1", 1.5))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_resenc_192_f1}: {e}")
-
-    if ckpt_resenc_192_f2:
-        try:
-            print(f"[+] Loading ResEncUNet3D (192^3, Fold 2): {os.path.basename(ckpt_resenc_192_f2)}")
-            m192_2 = ResEncUNet3D().to(device)
-            sd192_2 = torch.load(ckpt_resenc_192_f2, map_location=device)
-            m192_2.load_state_dict(sd192_2.get("model_state_dict", sd192_2))
-            m192_2.eval()
-            models_to_run.append((m192_2, (192, 192, 192), 2, 0.665, 2, "ResEncUNet3D-p192-f2", 1.0))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_resenc_192_f2}: {e}")
-
-    if ckpt_resenc_160:
-        try:
-            print(f"[+] Loading ResEncUNet3D (160^3, Fold 1): {os.path.basename(ckpt_resenc_160)}")
-            m160 = ResEncUNet3D().to(device)
-            sd160 = torch.load(ckpt_resenc_160, map_location=device)
-            m160.load_state_dict(sd160.get("model_state_dict", sd160))
-            m160.eval()
-            models_to_run.append((m160, (160, 160, 160), 2, 0.50, 2, "ResEncUNet3D-p160-f1", 1.0))
-        except Exception as e:
-            print(f"[!] Warning: Failed to load {ckpt_resenc_160}: {e}")
+            print(f"[!] Warning: Failed to load {ckpt_path}: {e}")
 
     total_w = sum(w for _, _, _, _, _, _, w in models_to_run)
     print("=" * 60)
@@ -788,20 +696,21 @@ def main():
                 else:
                     projected_hrs = 0.0
 
-                # 4-Tier Dynamic 9-Hour Pace Controller (Sequential batch_size=2 for 100% crash/OOM immunity)
+                # 4-tier dynamic 9h runtime pace controller
+                n_active = len(models_to_run)
                 active_models = models_to_run
-                tier_name = "TIER 1 (MAX SCORE: 27-Patch High-Overlap + 4x/2x TTA on All 8 Models)"
+                tier_name = f"TIER 1 (27-Patch High-Overlap + 4x/2x TTA, {n_active} Models)"
                 tier_level = 1
 
                 if elapsed_hrs > 8.15:
-                    tier_name = "TIER 4 (TURBO FINISH GUARD: Top 4 Models, 8-Patch, 1x TTA)"
                     active_models = models_to_run[:4]
+                    tier_name = f"TIER 4 (Finish Guard: Top {len(active_models)} Models, Low-Overlap, 1x TTA)"
                     tier_level = 4
                 elif elapsed_hrs > 7.20 or (projected_hrs > SAFE_BUDGET_HRS and elapsed_hrs > 4.5):
-                    tier_name = "TIER 3 (FAST HIGH-SCORE: 8/27-Patch + 2x/1x TTA on All 8 Models)"
+                    tier_name = f"TIER 3 (Balanced: 8/27-Patch + 2x/1x TTA, {n_active} Models)"
                     tier_level = 3
                 elif projected_hrs > SAFE_BUDGET_HRS or elapsed_hrs > 5.80:
-                    tier_name = "TIER 2 (HIGH SCORE: 27-Patch High-Overlap + 2x/1x TTA on All 8 Models)"
+                    tier_name = f"TIER 2 (High-Overlap + 2x/1x TTA, {n_active} Models)"
                     tier_level = 2
 
                 print(f"\n[*] [{v_idx+1}/{len(test_items)}] Volume {img_id} | Elapsed: {elapsed_hrs:.2f}h | Mode: {tier_name}")
@@ -852,7 +761,7 @@ def main():
                 if tier_level == 1:
                     tier1_vol_times.append(time.time() - vol_start)
 
-                print("    Applying Calibrated Seeded Hysteresis + Fast Rim Heightmap Repair + Watertight Topology...")
+                print("    Applying seeded hysteresis, heightmap hole repair, and watertight cavity fill...")
                 try:
                     binary_mask = seeded_hysteresis_postprocess(
                         ensemble_prob_map,

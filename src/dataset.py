@@ -114,16 +114,10 @@ class Vesuvius3DPatchDataset(Dataset):
     def _apply_augmentations(
         self, img: np.ndarray, lbl: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # 3D Random Axis Flips
-        if np.random.rand() > 0.5:
-            img = np.flip(img, axis=0)
-            lbl = np.flip(lbl, axis=0)
-        if np.random.rand() > 0.5:
-            img = np.flip(img, axis=1)
-            lbl = np.flip(lbl, axis=1)
-        if np.random.rand() > 0.5:
-            img = np.flip(img, axis=2)
-            lbl = np.flip(lbl, axis=2)
+        for axis in range(3):
+            if np.random.rand() > 0.5:
+                img = np.flip(img, axis=axis)
+                lbl = np.flip(lbl, axis=axis)
 
         # 3D 90-degree rotations in plane (H, W)
         k = np.random.choice([0, 1, 2, 3])
